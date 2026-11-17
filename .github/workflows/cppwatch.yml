@@ -16,6 +16,7 @@ jobs:
       - name: check
         env:
           CPP_COOKIE: ${{ secrets.CPP_COOKIE }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python cppwatch.py
       - name: save
         run: |
