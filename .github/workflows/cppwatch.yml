@@ -22,7 +22,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-         run: python cppwatch.py
+        run: python cppwatch.py
       - name: save
         run: |
           if [ ! -f state.json ]; then exit 0; fi
@@ -31,3 +31,4 @@ jobs:
           git add state.json
           git commit -m "state" || exit 0
           git push
+
