@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPP 摊位审核状态监控（GitHub Actions 版）
-- 每天/每小时读一次摊主中心页面，看「摊位审核状态」是否变了
-- 变了才发通知；没变保持沉默
-- 登录态失效时，只在早班那一轮（北京时间 8 点场）发一条提示
+CPP 摊位审核状态监控（GitHub Actions 版 v2）
+
+- 直接调用 allcpp 的接口读取摊位审核状态，不再依赖页面 HTML 文本
+- 状态有变化才通知，没变化保持完全静默
+- 登录态失效时，只在早班（北京时间 08 点那一轮）提示一次
+
+接口来源（均需登录 cookie）：
+  https://www.allcpp.cn/allcpp/event/getEventListApprove.do   → 摊位列表与审核状态
+  https://www.allcpp.cn/allcpp/event/getSectionType.do        → 摊位主题名
+
+状态映射（eventCircle.eventEnabled）：
+  0 已过审 / 1 审核中 / 2 未过审 / 3 未抽中 / 4 已退摊
+  若 eventEnabled==1 且 isReadyPublish 为真 → 预审通过 等待签约
+主题标记（eventCircle.sectionEnabled）：
+  0 (通过) / 1 (待审核) / 2 (被退审) / 3 (未通过)
 """
 
-import os
-import re
 import json
+import os
 import ssl
 import smtplib
 import urllib.request
@@ -18,58 +28,55 @@ from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.header import Header
 
-TARGET_URL = "https://www.allcpp.cn/mng/apply.do?t=1&pageNo=1"
+API_LIST = ("https://www.allcpp.cn/allcpp/event/getEventListApprove.do"
+            "?eventmainid=0&pageindex=1&pagesize=20&showapprove=1"
+            "&eventEnabled=1&cityId=-1&typeId=-1")
+API_SECTION = "https://www.allcpp.cn/allcpp/event/getSectionType.do?sectionId="
+
 STATE_PATH = "state.json"
 BJT = timezone(timedelta(hours=8))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+REFERER = "https://www.allcpp.cn/mng/apply.do?t=1&pageNo=1"
+
+TARGET_NAME = "COMICUP 33"
+TARGET_CID = 2396237
+
+STATUS_MAP = {
+    0: "已过审",
+    1: "审核中",
+    2: "未过审",
+    3: "未抽中",
+    4: "已退摊",
+}
+SECTION_MAP = {
+    0: "(通过)",
+    1: "(待审核)",
+    2: "(被退审)",
+    3: "(未通过)",
+}
 
 
 def log(msg):
-    print(f"[{datetime.now(BJT).strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    now = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
+    print("[%s] %s" % (now, msg), flush=True)
 
 
-def strip_tags(html):
-    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
-    html = re.sub(r"(?s)<br\s*/?>", "\n", html)
-    html = re.sub(r"(?s)</(p|div|li|tr|h\d)>", "\n", html)
-    html = re.sub(r"(?s)<[^>]+>", " ", html)
-    html = (html.replace("&nbsp;", " ").replace("&amp;", "&")
-                .replace("&lt;", "<").replace("&gt;", ">"))
-    html = re.sub(r"[ \t\u3000]+", " ", html)
-    html = re.sub(r"\n\s*\n+", "\n", html)
-    return html.strip()
-
-
-def fetch_page(cookie):
-    req = urllib.request.Request(TARGET_URL, headers={
+def fetch_json(url, cookie):
+    req = urllib.request.Request(url, headers={
         "Cookie": cookie,
         "User-Agent": UA,
-        "Referer": "https://www.allcpp.cn/",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": REFERER,
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "zh-CN,zh;q=0.9",
     })
     ctx = ssl.create_default_context()
     with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
         raw = resp.read()
         charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.status, raw.decode(charset, errors="replace")
-
-
-STATUS_RE = re.compile(r"摊位审核状态[：:]\s*([^\n|]{1,40})")
-THEME_RE = re.compile(r"摊位主题[：:]\s*([^\n|]{1,60})")
-NAME_RE = re.compile(r"摊位名[：:]\s*([^\n|]{1,60})")
-COUNT_RE = re.compile(r"已申摊位[：:]\s*([^\n|]{1,20})")
-
-
-def parse(text):
-    out = {}
-    for key, rx in (("status", STATUS_RE), ("theme", THEME_RE),
-                    ("shop", NAME_RE), ("count", COUNT_RE)):
-        m = rx.search(text)
-        if m:
-            out[key] = m.group(1).strip()
-    return out
+        text = raw.decode(charset, errors="replace")
+    return json.loads(text)
 
 
 def load_state():
@@ -77,26 +84,27 @@ def load_state():
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as e:
-            log(f"状态文件读取失败，按无基线处理：{e}")
+        except Exception:
+            return {}
     return {}
 
 
-def save_state(state, snap):
-    state.update(snap)
-    state["checked_at"] = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
+def save_state(snap):
+    data = dict(snap)
+    data["checked_at"] = datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S")
     with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    log(f"状态已写回：{json.dumps(snap, ensure_ascii=False)}")
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def send_mail(subject, body):
     host = os.environ.get("SMTP_HOST")
+    if not host:
+        return False
     port = int(os.environ.get("SMTP_PORT") or 465)
     user = os.environ.get("SMTP_USER")
     pwd = os.environ.get("SMTP_PASS")
     to = os.environ.get("MAIL_TO") or user
-    if not (host and user and pwd and to):
+    if not (user and pwd and to):
         return False
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = Header(subject, "utf-8")
@@ -104,19 +112,13 @@ def send_mail(subject, body):
     msg["To"] = to
     ctx = ssl.create_default_context()
     try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=30, context=ctx) as s:
-                s.login(user, pwd)
-                s.sendmail(user, [to], msg.as_string())
-        else:
-            with smtplib.SMTP(host, port, timeout=30) as s:
-                s.starttls(context=ctx)
-                s.login(user, pwd)
-                s.sendmail(user, [to], msg.as_string())
-        log("邮件通知已发送")
+        with smtplib.SMTP_SSL(host, port, timeout=30, context=ctx) as s:
+            s.login(user, pwd)
+            s.sendmail(user, [to], msg.as_string())
+        log("邮件已发送")
         return True
     except Exception as e:
-        log(f"邮件通知失败：{e}")
+        log("邮件发送失败：%s" % e)
         return False
 
 
@@ -124,99 +126,145 @@ def send_pushplus(subject, body):
     token = os.environ.get("PUSHPLUS_TOKEN")
     if not token:
         return False
-    payload = json.dumps({"token": token, "title": subject, "content": body,
-                          "template": "txt"}).encode()
-    req = urllib.request.Request("https://www.pushplus.plus/send", data=payload,
-                                 headers={"Content-Type": "application/json"})
+    payload = json.dumps({
+        "token": token,
+        "title": subject,
+        "content": body,
+        "template": "txt",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.pushplus.plus/send",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            log(f"PushPlus 返回：{r.read().decode('utf-8', 'ignore')[:200]}")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            result = resp.read().decode("utf-8", errors="replace")
+        log("PushPlus 返回：%s" % result[:200])
         return True
     except Exception as e:
-        log(f"PushPlus 通知失败：{e}")
+        log("PushPlus 发送失败：%s" % e)
         return False
 
 
 def notify(subject, body):
-    ok = False
-    if os.environ.get("PUSHPLUS_TOKEN"):
-        ok = send_pushplus(subject, body) or ok
-    if os.environ.get("SMTP_HOST"):
-        ok = send_mail(subject, body) or ok
-    if not ok:
+    sent = False
+    if send_pushplus(subject, body):
+        sent = True
+    if send_mail(subject, body):
+        sent = True
+    if not sent:
         log("没有任何可用的通知通道（缺 PUSHPLUS_TOKEN 或 SMTP_* 配置），本次只打印结果")
-    return ok
+
+
+def pick_target(payload):
+    """从接口返回里挑出目标摊位，返回 (eventCircle, item)"""
+    result = (payload or {}).get("result") or {}
+    items = result.get("list") or []
+    for item in items:
+        circle = item.get("eventCircle") or {}
+        if not circle:
+            continue
+        if circle.get("circleId") == TARGET_CID:
+            return circle, item
+        name = item.get("name") or item.get("totalName") or ""
+        if TARGET_NAME in name:
+            return circle, item
+    return None, None
+
+
+def section_name(section_id, cookie):
+    if not section_id:
+        return ""
+    try:
+        payload = fetch_json(API_SECTION + str(section_id), cookie)
+        inner = (payload.get("result") or {}).get("result") or {}
+        return inner.get("name") or ""
+    except Exception as e:
+        log("取摊位主题名失败（不影响主流程）：%s" % e)
+        return ""
 
 
 def main():
-    now = datetime.now(BJT)
-    is_morning = now.hour == 8
-
+    hour = datetime.now(BJT).hour
     cookie = os.environ.get("CPP_COOKIE", "").strip()
     if not cookie:
-        log("缺少 CPP_COOKIE")
-        if is_morning:
-            notify("CPP 监控：cookie 未配置", "仓库里还没设置 CPP_COOKIE，监控没在跑。")
+        log("缺少 CPP_COOKIE，监控没在跑")
+        if hour == 8:
+            notify("CPP 监控：cookie 没配置", "仓库里还没设置 CPP_COOKIE，监控没在跑。")
         return
 
     try:
-        code, html = fetch_page(cookie)
+        payload = fetch_json(API_LIST, cookie)
     except urllib.error.HTTPError as e:
-        log(f"HTTP {e.code}")
-        if is_morning:
-            notify("CPP 监控：登录态失效",
-                   f"摊主中心返回 HTTP {e.code}，cookie 可能过期了。\n"
-                   "请重新取一次 cookie 更新仓库里的 CPP_COOKIE。")
+        log("接口请求失败 HTTP %s" % e.code)
+        if hour == 8:
+            notify("CPP 监控：这轮没查成", "接口请求失败（HTTP %s），请在 App 里看一眼摊位状态。" % e.code)
         return
     except Exception as e:
-        log(f"请求异常：{e}")
-        if is_morning:
-            notify("CPP 监控：请求失败", f"连不上 CPP 页面：{e}")
+        log("接口请求异常：%s" % e)
+        if hour == 8:
+            notify("CPP 监控：这轮没查成", "接口请求异常，请在 App 里看一眼摊位状态。")
         return
 
-    text = strip_tags(html)
-    snap = parse(text)
+    circle, item = pick_target(payload)
 
-    if not snap.get("status"):
-        log("页面上找不到「摊位审核状态」，判断为登录态失效")
-        if is_morning:
-            notify("CPP 监控：登录态失效",
-                   "读不到摊位审核状态，估计 cookie 过期了。\n"
-                   "请重新取 cookie，更新仓库里的 CPP_COOKIE。")
+    # 登录态失效或结构变化时，result 为空 / 列表为空
+    if circle is None:
+        log("接口没有返回目标摊位，可能是登录态失效")
+        if hour == 8:
+            notify("CPP 监控这轮登录态已过期",
+                   "查不到 COMICUP 33 的摊位信息。请在 App 的「摊位管理」里看一眼，"
+                   "或回来跟我说一声，重新取一次 cookie。")
         return
 
-    log(f"读到：{json.dumps(snap, ensure_ascii=False)}")
+    enabled = circle.get("eventEnabled", -1)
+    status_text = STATUS_MAP.get(enabled, "未知状态(%s)" % enabled)
+    if enabled == 1 and circle.get("isReadyPublish"):
+        status_text = "预审通过 等待签约：%s摊" % (circle.get("prePositionCount") or 0)
 
-    state = load_state()
-    old_status = state.get("status")
-    old_theme = state.get("theme")
-    old_shop = state.get("shop")
+    sid = circle.get("sectionId") or 0
+    theme = section_name(sid, cookie) if sid > 0 else "无专区"
+    suffix = SECTION_MAP.get(circle.get("sectionEnabled"), "")
+    theme_text = (theme + " " + suffix).strip()
 
-    if not old_status:
-        log("首次运行，建立基线，不发送消息")
-        save_state(state, snap)
+    snap = {
+        "event": TARGET_NAME,
+        "cid": circle.get("circleId") or TARGET_CID,
+        "status": status_text,
+        "theme": theme_text,
+        "shop": circle.get("positionName") or "",
+        "count": str(circle.get("positionCount") or 0),
+    }
+    log("读到：%s | %s | 已申摊位 %s 个" % (snap["status"], snap["theme"], snap["count"]))
+
+    old = load_state()
+    if not old.get("status"):
+        log("首次运行，只建立基线，不发消息")
+        save_state(snap)
         return
 
     changed = []
-    if snap.get("status") and snap["status"] != old_status:
-        changed.append(f"审核状态：{old_status} → {snap['status']}")
-    if snap.get("theme") and old_theme and snap["theme"] != old_theme:
-        changed.append(f"摊位主题：{old_theme} → {snap['theme']}")
-    if snap.get("shop") and old_shop and snap["shop"] != old_shop:
-        changed.append(f"摊位名：{old_shop} → {snap['shop']}")
+    if old.get("status") != snap["status"]:
+        changed.append("审核状态：%s → %s" % (old.get("status"), snap["status"]))
+    if old.get("theme") != snap["theme"]:
+        changed.append("摊位主题：%s → %s" % (old.get("theme"), snap["theme"]))
+    if old.get("shop") != snap["shop"]:
+        changed.append("摊位名：%s → %s" % (old.get("shop"), snap["shop"]))
+    if old.get("count") != snap["count"]:
+        changed.append("已申摊位：%s → %s 个" % (old.get("count"), snap["count"]))
 
     if not changed:
-        log("无变动，保持静默")
-        save_state(state, snap)
+        log("与上次一致，保持静默")
+        save_state(snap)
         return
 
-    body = "\n".join(changed)
-    body += (f"\n\n当前：{snap.get('shop', '')} / 主题 {snap.get('theme', '')}"
-             f" / 已申 {snap.get('count', '')}")
-    body += f"\n检查时间：{now.strftime('%Y-%m-%d %H:%M')}"
-    log("状态有变动，发送通知：\n" + body)
-    notify("CPP 摊位审核状态有变", body)
-    save_state(state, snap)
+    body = "COMICUP 33（CID %s）摊位有变动：\n%s\n\n当前：%s | %s" % (
+        snap["cid"], "\n".join("- " + c for c in changed), snap["status"], snap["theme"])
+    log("检测到变动：" + "；".join(changed))
+    notify("CPP 摊位审核有变动：" + snap["status"], body)
+    save_state(snap)
 
 
 if __name__ == "__main__":
